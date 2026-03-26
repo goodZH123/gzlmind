@@ -1,6 +1,5 @@
 def main():
-    print("Hello from minimind-study!")
-
+    print("Hello, gzlMind!")
 
 if __name__ == "__main__":
     main()

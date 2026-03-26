@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig
 
 
-class MokioMindConfig(PretrainedConfig):
+class gzlMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -71,9 +71,10 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
-
+import math
 import torch
 from torch import nn
+from typing import Optional, Tuple, List, Union
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -86,3 +87,49 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
+    
+def precompute_freqs(
+        dim: int, 
+        end: int = int(32*1024), 
+        rope_base: float=1e6,
+        rope_scaling: Optional[dict] = None  
+        ):
+    # 初始化频率
+    freqs = 1.0 / (rope_base ** torch.arange(0, dim, 2)[:dim//2].float() / dim)
+    attn_factor = 1.0
+    if rope_scaling is not None:
+        orig_max, factor, attn_factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("attention_factor", 1.0),
+            rope_scaling.get("beta_fast", 32),
+            rope_scaling.get("beta_slow", 1),
+        )
+
+        if end > orig_max:
+            inv_dim = lambda b : (dim * math.log(orig_max/(2 * math.pi * b))) / (2 * math.log(rope_base)) 
+
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), dim//2 - 1)
+
+            ramp = torch.clamp((torch.arange(dim//2) - low)/(high - low), 0, 1)
+
+            freqs = freqs * (1 - ramp + ramp * factor)
+
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs) * attn_factor
+        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor   
+        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+        return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        x1 = x[..., x.shape[-1]//2:]
+        x2 = x[..., :x.shape[-1]//2]
+        return torch.cat((-x1, x2), dim=-1)
+
+    q_embed = q * cos.unsqueeze(unsqueeze_dim) + rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    k_embed = k * cos.unsqueeze(unsqueeze_dim) + rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+
+    return q_embed, k_embed
