@@ -2,7 +2,7 @@ from transformers import PretrainedConfig
 
 
 class gzlMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+    model_type = "glzmind"
 
     def __init__(
         self,
@@ -74,6 +74,7 @@ class gzlMindConfig(PretrainedConfig):
 import math
 import torch
 from torch import nn
+from torch.nn import functional as F
 from typing import Optional, Tuple, List, Union
 
 class RMSNorm(nn.Module):
@@ -133,3 +134,75 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = k * cos.unsqueeze(unsqueeze_dim) + rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
 
     return q_embed, k_embed
+
+def repeqt_kv(x:torch.Tensor, num_repeats: int):
+    if num_repeats == 1:
+        return x
+    batch_size, seq_len, heads, head_dim = x.shape
+    x = x[:,:,:,None,:].expand(batch_size, seq_len, heads, num_repeats, head_dim).reshape(batch_size, seq_len, heads * num_repeats, head_dim)
+    return x
+
+class Attention(nn.Module):
+    def __init__(self, args: gzlMindConfig):
+        super().__init__()
+        self.num_key_value_heads = (args.num_attention_heads 
+                                    if args.num_key_value_heads is None 
+                                    else args.num_key_value_heads)
+        
+        assert args.num_attention_heads % self.num_key_value_heads == 0 
+
+        self.local_heads = args.num_attention_heads
+        self.local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.local_heads // self.local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, self.local_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.local_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.local_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.local_heads * self.head_dim, args.hidden_size, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)    
+        self.res_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = args.flash_attention and hasattr(torch.nn.functional, "scaled_dot_product_attention")
+
+    def forward(self, x, past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+                attention_mask: Optional[torch.Tensor] = None, 
+                position_embeddings: Optional[torch.Tensor] = None,
+                use_cache: bool = False):
+        # 计算query,key,value对query、key加上位置编码，并且将key和value进行重复以适应多头注意力机制
+        # query与key相乘得到注意力权重，并通过掩码进行调整，经过softmax得到最终的注意力分布，最后将注意力分布与value相乘得到输出，并通过线性变换得到最终的结果
+
+        batch_size, seq_len, _ = x.shape
+        
+        qx = self.q_proj(x).view(batch_size, seq_len, self.local_heads, self.head_dim)
+        kx = self.k_proj(x).view(batch_size, seq_len, self.local_kv_heads, self.head_dim)
+        vx = self.v_proj(x).view(batch_size, seq_len, self.local_kv_heads, self.head_dim)
+
+        cos, sin = position_embeddings
+        qx, kx = apply_rotary_pos_emb(qx, kx, cos, sin)
+
+        if past_kv is not None:
+            kx = torch.cat([past_kv[0], kx], dim=1)
+            vx = torch.cat([past_kv[1], vx], dim=1)
+        past_kv = (kx, vx) if use_cache else None
+
+        qx = qx.transpose(1, 2)
+        kx = repeqt_kv(kx, self.n_rep).transpose(1, 2)
+        vx = repeqt_kv(vx, self.n_rep).transpose(1, 2)
+
+        if self.flash and (seq_len > 1) and (past_kv is None) and ((attention_mask is None) or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(qx, kx, vx, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            attn_weights = torch.matmul(qx, kx.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attention_mask = ((1 - attention_mask) * -1e9).unsqueeze(1).unsqueeze(2)
+                attn_weights = attn_weights + attention_mask
+
+            attn_weights = F.softmax(attn_weights, dim=-1).type_as(qx)
+            attn_weights = self.attn_dropout(attn_weights)
+            output = torch.matmul(attn_weights, vx)
+            output = output.transpose(1,2).reshape(batch_size, seq_len, self.local_heads * self.head_dim)
+        output = self.o_proj(output)
+        output = self.res_dropout(output)
+        return output, past_kv
