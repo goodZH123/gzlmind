@@ -6,6 +6,8 @@ def main():
                 torch.full((seq_len, seq_len), float("-inf")),
                 diagonal=1,
             )
+    y = torch.full((seq_len, seq_len), float("-inf"))
     print(x)
+    print(y)
 if __name__ == "__main__":
     main()

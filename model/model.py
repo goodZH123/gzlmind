@@ -76,6 +76,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from typing import Optional, Tuple, List, Union
+from transformers.activations import ACT2FN
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -195,6 +196,7 @@ class Attention(nn.Module):
             output = F.scaled_dot_product_attention(qx, kx, vx, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             attn_weights = torch.matmul(qx, kx.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            attn_weights[:,:,:,-seq_len:] += torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=attn_weights.device), diagonal=1)
             if attention_mask is not None:
                 attention_mask = ((1 - attention_mask) * -1e9).unsqueeze(1).unsqueeze(2)
                 attn_weights = attn_weights + attention_mask
@@ -206,3 +208,25 @@ class Attention(nn.Module):
         output = self.o_proj(output)
         output = self.res_dropout(output)
         return output, past_kv
+    
+class FeedForward(nn.Module):
+    def __init__(self, args: gzlMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((intermediate_size + 64 -1) // 64)
+
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+    
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        down = self.down_proj(self.act_fn(gate) * up)
+        output = self.dropout(down)
+        return output
+        
