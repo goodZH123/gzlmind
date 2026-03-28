@@ -1,13 +1,14 @@
 import torch    
 def main():
     print("Hello, gzlMind!")
-    seq_len = 5
-    x = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf")),
-                diagonal=1,
-            )
-    y = torch.full((seq_len, seq_len), float("-inf"))
+    x = torch.tensor([[1.0,0,0], [0,2.0,0], [0,0,0], [3.0,0,0]])
+    print(x.shape)
+    x = x.any(dim=-1)
     print(x)
+    y = x.nonzero()
     print(y)
+    y = y.flatten()
+    print(y)
+
 if __name__ == "__main__":
     main()

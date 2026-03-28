@@ -229,4 +229,38 @@ class FeedForward(nn.Module):
         down = self.down_proj(self.act_fn(gate) * up)
         output = self.dropout(down)
         return output
-        
+
+class MOEfeedForward(nn.Module):
+    def __init__(self, config: gzlMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_routed_experts)])
+    
+    def forward(self, x):
+        batch_size, seq_len, hidden_size = x.shape
+        x_flat = x.reshape(-1, hidden_size)
+        scores = self.gate(x_flat)
+        scores = F.softmax(scores, dim=-1)
+        topk_weight, topk_indices = torch.topk(scores, self.config.num_experts_per_tok, dim=-1)
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-9)
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_indices == i)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                expert_input = x_flat[token_idx]
+                y.index_add_(0, token_idx, (expert(expert_input) * topk_weight[mask]).to(y.dtype))        
+            elif self.training:
+                y[0,0] += 0.0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.aux_loss_alpha > 0:
+            load = F.one_hot(topk_indices, self.config.n_routed_experts).float().mean(dim=0)
+            self.aux_loss = (load * scores.mean(dim=0)).sum() * self.config.n_routed_experts * self.config.aux_loss_alpha
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.reshape(batch_size, seq_len, hidden_size)
+
+# class gzlMindBlock(nn.Module):
+#     def __init__(self, config: gzlMindConfig):
+#         super().__init__() 
