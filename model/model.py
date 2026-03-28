@@ -169,7 +169,7 @@ class Attention(nn.Module):
 
     def forward(self, x, past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
                 attention_mask: Optional[torch.Tensor] = None, 
-                position_embeddings: Optional[torch.Tensor] = None,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None,
                 use_cache: bool = False):
         # 计算query,key,value对query、key加上位置编码，并且将key和value进行重复以适应多头注意力机制
         # query与key相乘得到注意力权重，并通过掩码进行调整，经过softmax得到最终的注意力分布，最后将注意力分布与value相乘得到输出，并通过线性变换得到最终的结果
@@ -242,16 +242,16 @@ class MOEfeedForward(nn.Module):
         x_flat = x.reshape(-1, hidden_size)
         scores = self.gate(x_flat)
         scores = F.softmax(scores, dim=-1)
-        topk_weight, topk_indices = torch.topk(scores, self.config.num_experts_per_tok, dim=-1)
+        topk_weight, topk_indices = torch.topk(scores, self.config.num_experts_per_tok, dim=-1, sorted=False)
         if self.config.norm_topk_prob:
-            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-9)
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
         y = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
             mask = (topk_indices == i)
             if mask.any():
                 token_idx = mask.any(dim=-1).nonzero().flatten()
                 expert_input = x_flat[token_idx]
-                y.index_add_(0, token_idx, (expert(expert_input) * topk_weight[mask]).to(y.dtype))        
+                y.index_add_(0, token_idx, (expert(expert_input) * topk_weight[mask].reshape(-1, 1)).to(y.dtype))        
             elif self.training:
                 y[0,0] += 0.0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.aux_loss_alpha > 0:
@@ -261,6 +261,24 @@ class MOEfeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.reshape(batch_size, seq_len, hidden_size)
 
-# class gzlMindBlock(nn.Module):
-#     def __init__(self, config: gzlMindConfig):
-#         super().__init__() 
+class gzlMindBlock(nn.Module):
+    def __init__(self, layer_id, config: gzlMindConfig):
+        super().__init__() 
+        self.layer_id = layer_id
+        self.attn = Attention(config)
+        self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn = MOEfeedForward(config) if config.use_moe else FeedForward(config)
+    
+    def forward(self, hidden_state,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                attention_mask: Optional[torch.Tensor] = None, 
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None,
+                use_cache: bool = False):
+        normed_hidden_state = self.input_norm(hidden_state)
+        attn_output, present_kv = self.attn(normed_hidden_state, past_kv=past_kv, attention_mask=attention_mask, position_embeddings=position_embeddings, use_cache=use_cache)
+        hidden_state = hidden_state + attn_output
+        normed_hidden_state = self.post_norm(hidden_state)
+        ffn_output = self.ffn(normed_hidden_state)
+        hidden_state = hidden_state + ffn_output
+        return hidden_state, present_kv
