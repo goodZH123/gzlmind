@@ -282,3 +282,42 @@ class gzlMindBlock(nn.Module):
         ffn_output = self.ffn(normed_hidden_state)
         hidden_state = hidden_state + ffn_output
         return hidden_state, present_kv
+    
+class gzlMindModel(nn.Module):
+    def __init__(self, config: gzlMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([gzlMindBlock(i, config) for i in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        freqs_cos, freqs_sin = precompute_freqs(config.hidden_size // config.num_attention_heads, end=config.max_position_embeddings,rope_base=config.rope_theta ,rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, input_ids, attention_mask=None, past_kvs=None, use_cache=False, **kwargs):
+        batch_size, seq_len = input_ids.shape
+        if hasattr(past_kvs, "layers"):
+            past_kvs = None
+        past_kvs = past_kvs or [None] * len(self.layers)
+        start_position = past_kvs[0][0].shape[1] if past_kvs[0] is not None else 0
+        position_embeddings = (
+            self.freqs_cos[start_position : start_position + seq_len],
+            self.freqs_sin[start_position : start_position + seq_len]
+        )
+        hidden_state = self.dropout(self.tok_embeddings(input_ids))
+        presents = []
+        for layer, past_kv in zip(self.layers, past_kvs):
+            hidden_state, present = layer(
+                hidden_state,
+                past_kv=past_kv,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                use_cache=use_cache
+            )
+            presents.append(present)
+        hidden_state = self.norm(hidden_state)
+        aux_loss = sum([l.ffn.aux_loss for l in self.layers if isinstance(l.ffn, MOEfeedForward)], hidden_state.new_zeros(1).squeeze())
+        return hidden_state, presents, aux_loss
